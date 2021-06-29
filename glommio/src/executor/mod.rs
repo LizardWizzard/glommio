@@ -1979,7 +1979,7 @@ mod test {
         SharesManager,
     };
     use core::mem::MaybeUninit;
-    use futures::join;
+    use futures::{join, future::{poll_fn, join_all}};
     use std::{
         cell::Cell,
         collections::HashMap,
@@ -2995,6 +2995,92 @@ mod test {
     fn executor_inception() {
         LocalExecutor::default().run(async {
             LocalExecutor::default().run(async {});
+        });
+    }
+
+    #[test]
+    fn wake_by_ref_refcount_underflow_with_join_handle() {
+        enum TaskState {
+            Pending(Option<Waker>),
+            Ready,
+        }
+
+        LocalExecutor::default().run(async {
+            let slot: Rc<RefCell<TaskState>> = Rc::new(RefCell::new(TaskState::Pending(None)));
+            let cloned_slot = slot.clone();
+            let jh = Local::local(async move {
+                // first task, places waker of self into slot, when polled checks for result, if it's ready, returns Ready,
+                // otherwise return Pending
+                poll_fn::<(), _>(|cx| {
+                    let current = &mut *cloned_slot.borrow_mut();
+                    match current {
+                        TaskState::Pending(maybe_waker) => match maybe_waker {
+                            Some(_) => unreachable!(),
+                            None => {
+                                *current = TaskState::Pending(Some(cx.waker().clone()));
+                                Poll::Pending
+                            },
+                        },
+                        TaskState::Ready => Poll::Ready(())
+                    }
+                }).await;
+            }).detach();
+            let jh2 = Local::local(async move {
+                // second task, checks slot for first task waker, wakes it by ref, and then it is dropped.
+                let current = &mut *slot.borrow_mut();
+                match current {
+                    TaskState::Pending(maybe_waker) => {
+                        let waker = maybe_waker.take().unwrap();
+                        waker.wake_by_ref();
+                        *current = TaskState::Ready;  // <-- waker dropped here, refcount is zero
+                    },
+                    TaskState::Ready => unreachable!(), // task cannot be ready at this time
+                }
+            }).detach();
+            join_all(vec![jh, jh2]).await;
+        });
+    }
+
+    #[test]
+    fn wake_by_ref_refcount_underflow_with_sleep() {
+        enum TaskState {
+            Pending(Option<Waker>),
+            Ready,
+        }
+
+        LocalExecutor::default().run(async {
+            let slot: Rc<RefCell<TaskState>> = Rc::new(RefCell::new(TaskState::Pending(None)));
+            let cloned_slot = slot.clone();
+            Local::local(async move {
+                // first task, places waker of self into slot, when polled checks for result, if it's ready, returns Ready,
+                // otherwise return Pending
+                poll_fn::<(), _>(|cx| {
+                    let current = &mut *cloned_slot.borrow_mut();
+                    match current {
+                        TaskState::Pending(maybe_waker) => match maybe_waker {
+                            Some(_) => unreachable!(),
+                            None => {
+                                *current = TaskState::Pending(Some(cx.waker().clone()));
+                                Poll::Pending
+                            },
+                        },
+                        TaskState::Ready => Poll::Ready(())
+                    }
+                }).await;
+            }).detach();
+            Local::local(async move {
+                // second task, checks slot for first task waker, wakes it by ref, and then it is dropped.
+                let current = &mut *slot.borrow_mut();
+                match current {
+                    TaskState::Pending(maybe_waker) => {
+                        let waker = maybe_waker.take().unwrap();
+                        waker.wake_by_ref();
+                        *current = TaskState::Ready;  // <-- waker dropped here, refcount is zero
+                    },
+                    TaskState::Ready => unreachable!(), // task cannot be ready at this time
+                }
+            }).detach();
+            timer::sleep(Duration::from_millis(1)).await;
         });
     }
 }
